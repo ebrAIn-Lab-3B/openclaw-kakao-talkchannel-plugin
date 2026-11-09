@@ -4,6 +4,18 @@ const DEFAULT_RECONNECT_DELAY_MS = 1000;
 const DEFAULT_MAX_RECONNECT_DELAY_MS = 30000;
 const DEFAULT_TIMEOUT_MS = 300000; // 5 minutes - SSE connections need longer timeout
 
+// Pause before reconnecting after the server closes the stream cleanly.
+//
+// A clean close raises no error, so it skips the backoff in the catch block
+// entirely. The relay recycles streams on a timer, so without this the loop
+// reconnects instantly, forever. That alone would only be wasteful — but the
+// relay re-flushes queued messages to every new subscriber, so each reconnect
+// replays the backlog. On Hermes this turned one inbound message into 94
+// deliveries and 94 agent turns.
+//
+// A pairing-triggered break is exempt: it is deliberate and must be immediate.
+const CLEAN_CLOSE_RECONNECT_DELAY_MS = 1000;
+
 export interface SSEHandlers {
   onMessage: (msg: InboundMessage) => Promise<void>;
   onError?: (error: Error) => void;
@@ -222,6 +234,14 @@ export async function connectSSE(
         }
       } finally {
         reader.cancel().catch(() => {});
+      }
+
+      // Reached only on a clean exit from the read loop. Pairing breaks out on
+      // purpose and must reconnect at once; anything else is the server having
+      // closed the stream, which needs a pause before retrying.
+      if (!reconnectForPairing && !abortSignal.aborted) {
+        handlers.onDisconnected?.();
+        await sleep(CLEAN_CLOSE_RECONNECT_DELAY_MS, abortSignal);
       }
     } catch (error) {
       if (abortSignal.aborted) {
